@@ -20,9 +20,14 @@ const (
 	windowSeconds = 300
 
 	searchEventsSubject = "search.events"
+
+	spamGuardMaxEvents = 3
 )
 
-var windowDuration = 5 * time.Minute
+var (
+	windowDuration  = 5 * time.Minute
+	spamGuardWindow = time.Minute
+)
 
 type TrendItem struct {
 	Query string `json:"query"`
@@ -77,11 +82,17 @@ type StopList struct {
 	words map[string]struct{}
 }
 
+type SpamGuard struct {
+	mu     sync.Mutex
+	events map[string][]time.Time
+}
+
 func main() {
 	aggregator := NewAggregator()
 	stopList := NewStopList()
+	spamGuard := NewSpamGuard()
 
-	natsConn := connectNATS(aggregator)
+	natsConn := connectNATS(aggregator, spamGuard)
 	if natsConn != nil {
 		defer natsConn.Close()
 	}
@@ -90,7 +101,7 @@ func main() {
 
 	mux.HandleFunc("GET /healthz", healthHandler)
 	mux.HandleFunc("GET /api/v1/trends/top", topHandler(aggregator, stopList))
-	mux.HandleFunc("POST /debug/search-events", addSearchEventHandler(aggregator))
+	mux.HandleFunc("POST /debug/search-events", addSearchEventHandler(aggregator, spamGuard))
 
 	mux.HandleFunc("GET /api/v1/stop-list", getStopListHandler(stopList))
 	mux.HandleFunc("POST /api/v1/stop-list", addStopWordHandler(stopList))
@@ -111,7 +122,7 @@ func main() {
 	}
 }
 
-func connectNATS(aggregator *Aggregator) *nats.Conn {
+func connectNATS(aggregator *Aggregator, spamGuard *SpamGuard) *nats.Conn {
 	natsURL := getEnv("NATS_URL", nats.DefaultURL)
 
 	natsConn, err := nats.Connect(natsURL)
@@ -120,7 +131,7 @@ func connectNATS(aggregator *Aggregator) *nats.Conn {
 		return nil
 	}
 
-	_, err = natsConn.Subscribe(searchEventsSubject, searchEventMessageHandler(aggregator))
+	_, err = natsConn.Subscribe(searchEventsSubject, searchEventMessageHandler(aggregator, spamGuard))
 	if err != nil {
 		log.Println("failed to subscribe to nats subject:", err)
 		natsConn.Close()
@@ -138,7 +149,7 @@ func connectNATS(aggregator *Aggregator) *nats.Conn {
 	return natsConn
 }
 
-func searchEventMessageHandler(aggregator *Aggregator) nats.MsgHandler {
+func searchEventMessageHandler(aggregator *Aggregator, spamGuard *SpamGuard) nats.MsgHandler {
 	return func(message *nats.Msg) {
 		var request SearchEventRequest
 
@@ -156,6 +167,12 @@ func searchEventMessageHandler(aggregator *Aggregator) nats.MsgHandler {
 		eventTime, err := parseEventTime(request.CreatedAt)
 		if err != nil {
 			log.Println("invalid created_at in nats message:", err)
+			return
+		}
+
+		identity := actorIdentity(request)
+		if !spamGuard.Allow(identity, query, eventTime) {
+			log.Println("search event skipped by spam guard:", query)
 			return
 		}
 
@@ -281,6 +298,58 @@ func (s *StopList) Snapshot() map[string]struct{} {
 	return snapshot
 }
 
+func NewSpamGuard() *SpamGuard {
+	return &SpamGuard{
+		events: make(map[string][]time.Time),
+	}
+}
+
+func (s *SpamGuard) Allow(identity string, query string, now time.Time) bool {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return true
+	}
+
+	key := identity + ":" + query
+	minAllowedTime := now.Add(-spamGuardWindow)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	eventTimes := s.events[key]
+	actualTimes := eventTimes[:0]
+
+	for _, eventTime := range eventTimes {
+		if eventTime.After(minAllowedTime) || eventTime.Equal(minAllowedTime) {
+			actualTimes = append(actualTimes, eventTime)
+		}
+	}
+
+	if len(actualTimes) >= spamGuardMaxEvents {
+		s.events[key] = actualTimes
+		return false
+	}
+
+	actualTimes = append(actualTimes, now)
+	s.events[key] = actualTimes
+
+	return true
+}
+
+func actorIdentity(request SearchEventRequest) string {
+	userID := strings.TrimSpace(request.UserID)
+	if userID != "" {
+		return "user:" + userID
+	}
+
+	sessionID := strings.TrimSpace(request.SessionID)
+	if sessionID != "" {
+		return "session:" + sessionID
+	}
+
+	return ""
+}
+
 func isBlockedByStopList(query string, stopWords map[string]struct{}) bool {
 	for word := range stopWords {
 		if query == word || strings.Contains(query, word) {
@@ -333,7 +402,7 @@ func topHandler(aggregator *Aggregator, stopList *StopList) http.HandlerFunc {
 	}
 }
 
-func addSearchEventHandler(aggregator *Aggregator) http.HandlerFunc {
+func addSearchEventHandler(aggregator *Aggregator, spamGuard *SpamGuard) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var request SearchEventRequest
 
@@ -356,6 +425,16 @@ func addSearchEventHandler(aggregator *Aggregator) http.HandlerFunc {
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error": "created_at must be in RFC3339 format",
+			})
+			return
+		}
+
+		identity := actorIdentity(request)
+		if !spamGuard.Allow(identity, query, eventTime) {
+			writeJSON(w, http.StatusAccepted, SearchEventResponse{
+				Status:    "filtered_by_spam_guard",
+				Query:     query,
+				CreatedAt: eventTime.Format(time.RFC3339),
 			})
 			return
 		}
