@@ -31,12 +31,17 @@ type TopResponse struct {
 }
 
 type SearchEventRequest struct {
+	EventID string `json:"event_id"`
 	Query string `json:"query"`
+	UserID string `json:"user_id"`
+	SessionID string `json:"session_id"`
+	CreatedAt string `json:"created_at"`
 }
 
 type SearchEventResponse struct {
 	Status string `json:"status"`
-	Query  string `json:"query"`
+	Query string `json:"query"`
+	CreatedAt string `json:"created_at"`
 }
 
 type SearchEvent struct {
@@ -198,11 +203,20 @@ func addSearchEventHandler(aggregator *Aggregator) http.HandlerFunc {
 			return
 		}
 
-		aggregator.Add(query, time.Now())
+		eventTime, err := parseEventTime(request.CreatedAt)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "created_at must be in RFC3339 format",
+			})
+			return
+		}
+
+		aggregator.Add(query, eventTime)
 
 		writeJSON(w, http.StatusCreated, SearchEventResponse{
 			Status: "accepted",
-			Query:  query,
+			Query: query,
+			CreatedAt: eventTime.Format(time.RFC3339),
 		})
 	}
 }
@@ -213,6 +227,21 @@ func normalizeQuery(query string) string {
 	query = strings.Join(strings.Fields(query), " ")
 
 	return query
+}
+
+func parseEventTime(rawTime string) (time.Time, error) {
+	rawTime = strings.TrimSpace(rawTime)
+
+	if rawTime == "" {
+		return time.Now(), nil
+	}
+
+	eventTime, err := time.Parse(time.RFC3339, rawTime)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	return eventTime, nil
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, data any) {
