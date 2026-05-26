@@ -13,7 +13,7 @@ import (
 
 const (
 	defaultLimit  = 10
-	maxLimit = 100
+	maxLimit      = 100
 	windowSeconds = 300
 )
 
@@ -21,51 +21,74 @@ var windowDuration = 5 * time.Minute
 
 type TrendItem struct {
 	Query string `json:"query"`
-	Count int `json:"count"`
+	Count int    `json:"count"`
 }
 
 type TopResponse struct {
-	WindowSeconds int `json:"window_seconds"`
-	Limit         int `json:"limit"`
+	WindowSeconds int         `json:"window_seconds"`
+	Limit         int         `json:"limit"`
 	Items         []TrendItem `json:"items"`
 }
 
 type SearchEventRequest struct {
-	EventID string `json:"event_id"`
-	Query string `json:"query"`
-	UserID string `json:"user_id"`
+	EventID   string `json:"event_id"`
+	Query     string `json:"query"`
+	UserID    string `json:"user_id"`
 	SessionID string `json:"session_id"`
 	CreatedAt string `json:"created_at"`
 }
 
 type SearchEventResponse struct {
-	Status string `json:"status"`
-	Query string `json:"query"`
+	Status    string `json:"status"`
+	Query     string `json:"query"`
 	CreatedAt string `json:"created_at"`
 }
 
+type StopWordRequest struct {
+	Word string `json:"word"`
+}
+
+type StopWordResponse struct {
+	Status string `json:"status"`
+	Word   string `json:"word"`
+}
+
+type StopListResponse struct {
+	Items []string `json:"items"`
+}
+
 type SearchEvent struct {
-	Query string
+	Query     string
 	CreatedAt time.Time
 }
 
 type Aggregator struct {
-	mu sync.Mutex
+	mu     sync.Mutex
 	events []SearchEvent
+}
+
+type StopList struct {
+	mu    sync.RWMutex
+	words map[string]struct{}
 }
 
 func main() {
 	aggregator := NewAggregator()
+	stopList := NewStopList()
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", healthHandler)
-	mux.HandleFunc("GET /api/v1/trends/top", topHandler(aggregator))
+	mux.HandleFunc("GET /api/v1/trends/top", topHandler(aggregator, stopList))
 	mux.HandleFunc("POST /debug/search-events", addSearchEventHandler(aggregator))
 
+	mux.HandleFunc("GET /api/v1/stop-list", getStopListHandler(stopList))
+	mux.HandleFunc("POST /api/v1/stop-list", addStopWordHandler(stopList))
+	mux.HandleFunc("DELETE /api/v1/stop-list", deleteStopWordHandler(stopList))
+
 	server := &http.Server{
-		Addr: ":8080",
-		Handler: mux,
+		Addr:         ":8080",
+		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -89,12 +112,12 @@ func (a *Aggregator) Add(query string, now time.Time) {
 	defer a.mu.Unlock()
 
 	a.events = append(a.events, SearchEvent{
-		Query: query,
+		Query:     query,
 		CreatedAt: now,
 	})
 }
 
-func (a *Aggregator) Top(limit int, now time.Time) []TrendItem {
+func (a *Aggregator) Top(limit int, now time.Time, stopWords map[string]struct{}) []TrendItem {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -103,6 +126,10 @@ func (a *Aggregator) Top(limit int, now time.Time) []TrendItem {
 	counts := make(map[string]int)
 
 	for _, event := range a.events {
+		if isBlockedByStopList(event.Query, stopWords) {
+			continue
+		}
+
 		counts[event.Query]++
 	}
 
@@ -144,13 +171,71 @@ func (a *Aggregator) removeOldEvents(now time.Time) {
 	a.events = actualEvents
 }
 
+func NewStopList() *StopList {
+	return &StopList{
+		words: make(map[string]struct{}),
+	}
+}
+
+func (s *StopList) Add(word string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.words[word] = struct{}{}
+}
+
+func (s *StopList) Delete(word string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.words, word)
+}
+
+func (s *StopList) List() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	items := make([]string, 0, len(s.words))
+
+	for word := range s.words {
+		items = append(items, word)
+	}
+
+	sort.Strings(items)
+
+	return items
+}
+
+func (s *StopList) Snapshot() map[string]struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	snapshot := make(map[string]struct{}, len(s.words))
+
+	for word := range s.words {
+		snapshot[word] = struct{}{}
+	}
+
+	return snapshot
+}
+
+func isBlockedByStopList(query string, stopWords map[string]struct{}) bool {
+	for word := range stopWords {
+		if query == word || strings.Contains(query, word) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "ok",
 	})
 }
 
-func topHandler(aggregator *Aggregator) http.HandlerFunc {
+func topHandler(aggregator *Aggregator, stopList *StopList) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		limit := defaultLimit
 
@@ -174,10 +259,12 @@ func topHandler(aggregator *Aggregator) http.HandlerFunc {
 			limit = parsedLimit
 		}
 
+		stopWords := stopList.Snapshot()
+
 		response := TopResponse{
 			WindowSeconds: windowSeconds,
 			Limit:         limit,
-			Items:         aggregator.Top(limit, time.Now()),
+			Items:         aggregator.Top(limit, time.Now(), stopWords),
 		}
 
 		writeJSON(w, http.StatusOK, response)
@@ -214,9 +301,64 @@ func addSearchEventHandler(aggregator *Aggregator) http.HandlerFunc {
 		aggregator.Add(query, eventTime)
 
 		writeJSON(w, http.StatusCreated, SearchEventResponse{
-			Status: "accepted",
-			Query: query,
+			Status:    "accepted",
+			Query:     query,
 			CreatedAt: eventTime.Format(time.RFC3339),
+		})
+	}
+}
+
+func getStopListHandler(stopList *StopList) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, StopListResponse{
+			Items: stopList.List(),
+		})
+	}
+}
+
+func addStopWordHandler(stopList *StopList) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var request StopWordRequest
+
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "invalid json body",
+			})
+			return
+		}
+
+		word := normalizeQuery(request.Word)
+		if word == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "word must not be empty",
+			})
+			return
+		}
+
+		stopList.Add(word)
+
+		writeJSON(w, http.StatusCreated, StopWordResponse{
+			Status: "added",
+			Word:   word,
+		})
+	}
+}
+
+func deleteStopWordHandler(stopList *StopList) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		word := normalizeQuery(r.URL.Query().Get("word"))
+		if word == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "word query parameter is required",
+			})
+			return
+		}
+
+		stopList.Delete(word)
+
+		writeJSON(w, http.StatusOK, StopWordResponse{
+			Status: "deleted",
+			Word:   word,
 		})
 	}
 }
