@@ -12,10 +12,12 @@ import (
 )
 
 const (
-	windowSeconds = 300
 	defaultLimit  = 10
 	maxLimit = 100
+	windowSeconds = 300
 )
+
+var windowDuration = 5 * time.Minute
 
 type TrendItem struct {
 	Query string `json:"query"`
@@ -34,23 +36,21 @@ type SearchEventRequest struct {
 
 type SearchEventResponse struct {
 	Status string `json:"status"`
-	Query string `json:"query"`
+	Query  string `json:"query"`
 }
 
-type bucket struct {
-	UnixSecond int64
-	Counts map[string]int
+type SearchEvent struct {
+	Query string
+	CreatedAt time.Time
 }
 
 type Aggregator struct {
 	mu sync.Mutex
-	window  int
-	buckets []bucket
-	totals  map[string]int
+	events []SearchEvent
 }
 
 func main() {
-	aggregator := NewAggregator(windowSeconds)
+	aggregator := NewAggregator()
 
 	mux := http.NewServeMux()
 
@@ -73,60 +73,37 @@ func main() {
 	}
 }
 
-func NewAggregator(window int) *Aggregator {
+func NewAggregator() *Aggregator {
 	return &Aggregator{
-		window:  window,
-		buckets: make([]bucket, window),
-		totals:  make(map[string]int),
+		events: make([]SearchEvent, 0),
 	}
 }
 
-func (a *Aggregator) Add(query string, now time.Time) bool {
-	normalizedQuery := normalizeQuery(query)
-	if normalizedQuery == "" {
-		return false
-	}
-
-	currentSecond := now.Unix()
-
+func (a *Aggregator) Add(query string, now time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.cleanupExpiredBuckets(currentSecond)
-
-	bucketIndex := int(currentSecond % int64(a.window))
-	currentBucket := &a.buckets[bucketIndex]
-
-	if currentBucket.Counts == nil {
-		currentBucket.Counts = make(map[string]int)
-	}
-
-	if currentBucket.UnixSecond != currentSecond {
-		a.clearBucket(currentBucket)
-		currentBucket.UnixSecond = currentSecond
-	}
-
-	currentBucket.Counts[normalizedQuery]++
-	a.totals[normalizedQuery]++
-
-	return true
+	a.events = append(a.events, SearchEvent{
+		Query: query,
+		CreatedAt: now,
+	})
 }
 
 func (a *Aggregator) Top(limit int, now time.Time) []TrendItem {
-	if limit <= 0 {
-		return []TrendItem{}
-	}
-
-	currentSecond := now.Unix()
-
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.cleanupExpiredBuckets(currentSecond)
+	a.removeOldEvents(now)
 
-	items := make([]TrendItem, 0, len(a.totals))
+	counts := make(map[string]int)
 
-	for query, count := range a.totals {
+	for _, event := range a.events {
+		counts[event.Query]++
+	}
+
+	items := make([]TrendItem, 0, len(counts))
+
+	for query, count := range counts {
 		items = append(items, TrendItem{
 			Query: query,
 			Count: count,
@@ -148,45 +125,18 @@ func (a *Aggregator) Top(limit int, now time.Time) []TrendItem {
 	return items[:limit]
 }
 
-func (a *Aggregator) cleanupExpiredBuckets(currentSecond int64) {
-	minAllowedSecond := currentSecond - int64(a.window) + 1
+func (a *Aggregator) removeOldEvents(now time.Time) {
+	minAllowedTime := now.Add(-windowDuration)
 
-	for i := range a.buckets {
-		currentBucket := &a.buckets[i]
+	actualEvents := a.events[:0]
 
-		if currentBucket.Counts == nil {
-			continue
-		}
-
-		if currentBucket.UnixSecond < minAllowedSecond {
-			a.clearBucket(currentBucket)
-			currentBucket.UnixSecond = 0
-		}
-	}
-}
-
-func (a *Aggregator) clearBucket(b *bucket) {
-	for query, count := range b.Counts {
-		a.totals[query] -= count
-
-		if a.totals[query] <= 0 {
-			delete(a.totals, query)
+	for _, event := range a.events {
+		if event.CreatedAt.After(minAllowedTime) || event.CreatedAt.Equal(minAllowedTime) {
+			actualEvents = append(actualEvents, event)
 		}
 	}
 
-	b.Counts = make(map[string]int)
-}
-
-func normalizeQuery(query string) string {
-	query = strings.TrimSpace(query)
-	query = strings.ToLower(query)
-	query = strings.Join(strings.Fields(query), " ")
-
-	if len(query) > 200 {
-		query = query[:200]
-	}
-
-	return query
+	a.events = actualEvents
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -219,12 +169,10 @@ func topHandler(aggregator *Aggregator) http.HandlerFunc {
 			limit = parsedLimit
 		}
 
-		items := aggregator.Top(limit, time.Now())
-
 		response := TopResponse{
 			WindowSeconds: windowSeconds,
 			Limit:         limit,
-			Items:         items,
+			Items:         aggregator.Top(limit, time.Now()),
 		}
 
 		writeJSON(w, http.StatusOK, response)
@@ -242,21 +190,29 @@ func addSearchEventHandler(aggregator *Aggregator) http.HandlerFunc {
 			return
 		}
 
-		normalizedQuery := normalizeQuery(request.Query)
-		if normalizedQuery == "" {
+		query := normalizeQuery(request.Query)
+		if query == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error": "query must not be empty",
 			})
 			return
 		}
 
-		aggregator.Add(normalizedQuery, time.Now())
+		aggregator.Add(query, time.Now())
 
 		writeJSON(w, http.StatusCreated, SearchEventResponse{
 			Status: "accepted",
-			Query:  normalizedQuery,
+			Query:  query,
 		})
 	}
+}
+
+func normalizeQuery(query string) string {
+	query = strings.TrimSpace(query)
+	query = strings.ToLower(query)
+	query = strings.Join(strings.Fields(query), " ")
+
+	return query
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, data any) {
