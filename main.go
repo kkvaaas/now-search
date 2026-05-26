@@ -4,17 +4,22 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 const (
 	defaultLimit  = 10
 	maxLimit      = 100
 	windowSeconds = 300
+
+	searchEventsSubject = "search.events"
 )
 
 var windowDuration = 5 * time.Minute
@@ -76,6 +81,11 @@ func main() {
 	aggregator := NewAggregator()
 	stopList := NewStopList()
 
+	natsConn := connectNATS(aggregator)
+	if natsConn != nil {
+		defer natsConn.Close()
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", healthHandler)
@@ -98,6 +108,58 @@ func main() {
 
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func connectNATS(aggregator *Aggregator) *nats.Conn {
+	natsURL := getEnv("NATS_URL", nats.DefaultURL)
+
+	natsConn, err := nats.Connect(natsURL)
+	if err != nil {
+		log.Println("nats is not connected:", err)
+		return nil
+	}
+
+	_, err = natsConn.Subscribe(searchEventsSubject, searchEventMessageHandler(aggregator))
+	if err != nil {
+		log.Println("failed to subscribe to nats subject:", err)
+		natsConn.Close()
+		return nil
+	}
+
+	if err := natsConn.Flush(); err != nil {
+		log.Println("failed to flush nats subscription:", err)
+		natsConn.Close()
+		return nil
+	}
+
+	log.Println("subscribed to nats subject:", searchEventsSubject)
+
+	return natsConn
+}
+
+func searchEventMessageHandler(aggregator *Aggregator) nats.MsgHandler {
+	return func(message *nats.Msg) {
+		var request SearchEventRequest
+
+		if err := json.Unmarshal(message.Data, &request); err != nil {
+			log.Println("failed to decode nats message:", err)
+			return
+		}
+
+		query := normalizeQuery(request.Query)
+		if query == "" {
+			log.Println("empty query in nats message")
+			return
+		}
+
+		eventTime, err := parseEventTime(request.CreatedAt)
+		if err != nil {
+			log.Println("invalid created_at in nats message:", err)
+			return
+		}
+
+		aggregator.Add(query, eventTime)
 	}
 }
 
@@ -384,6 +446,15 @@ func parseEventTime(rawTime string) (time.Time, error) {
 	}
 
 	return eventTime, nil
+}
+
+func getEnv(key string, defaultValue string) string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue
+	}
+
+	return value
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, data any) {
