@@ -22,8 +22,9 @@ const (
 
 	searchEventsSubject = "search.events"
 
-	spamGuardWindow    = time.Minute
-	spamGuardMaxEvents = 3
+	spamGuardWindow          = time.Minute
+	spamGuardMaxEvents       = 3
+	spamGuardCleanupInterval = time.Minute
 
 	topSnapshotRefreshInterval = time.Second
 )
@@ -104,6 +105,7 @@ func main() {
 	spamGuard := NewSpamGuard()
 
 	startTopSnapshotUpdater(aggregator, stopList, topCache)
+	startSpamGuardCleanup(spamGuard)
 
 	natsConn := connectNATS(aggregator, spamGuard)
 	if natsConn != nil {
@@ -138,7 +140,20 @@ func main() {
 func connectNATS(aggregator *Aggregator, spamGuard *SpamGuard) *nats.Conn {
 	natsURL := getEnv("NATS_URL", nats.DefaultURL)
 
-	natsConn, err := nats.Connect(natsURL)
+	natsConn, err := nats.Connect(
+		natsURL,
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2*time.Second),
+		nats.DisconnectErrHandler(func(conn *nats.Conn, err error) {
+			log.Println("nats disconnected:", err)
+		}),
+		nats.ReconnectHandler(func(conn *nats.Conn) {
+			log.Println("nats reconnected:", conn.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(conn *nats.Conn) {
+			log.Println("nats connection closed")
+		}),
+	)
 	if err != nil {
 		log.Println("nats is not connected:", err)
 		return nil
@@ -384,6 +399,17 @@ func NewSpamGuard() *SpamGuard {
 	}
 }
 
+func startSpamGuardCleanup(spamGuard *SpamGuard) {
+	go func() {
+		ticker := time.NewTicker(spamGuardCleanupInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			spamGuard.Cleanup(time.Now())
+		}
+	}()
+}
+
 func (s *SpamGuard) Allow(identity string, query string, now time.Time) bool {
 	identity = strings.TrimSpace(identity)
 	if identity == "" {
@@ -406,14 +432,49 @@ func (s *SpamGuard) Allow(identity string, query string, now time.Time) bool {
 	}
 
 	if len(actualTimes) >= spamGuardMaxEvents {
-		s.events[key] = actualTimes
+		s.events[key] = shrinkTimesIfNeeded(actualTimes)
 		return false
 	}
 
 	actualTimes = append(actualTimes, now)
-	s.events[key] = actualTimes
+	s.events[key] = shrinkTimesIfNeeded(actualTimes)
 
 	return true
+}
+
+func (s *SpamGuard) Cleanup(now time.Time) {
+	minAllowedTime := now.Add(-spamGuardWindow)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for key, eventTimes := range s.events {
+		actualTimes := eventTimes[:0]
+
+		for _, eventTime := range eventTimes {
+			if eventTime.After(minAllowedTime) || eventTime.Equal(minAllowedTime) {
+				actualTimes = append(actualTimes, eventTime)
+			}
+		}
+
+		if len(actualTimes) == 0 {
+			delete(s.events, key)
+			continue
+		}
+
+		s.events[key] = shrinkTimesIfNeeded(actualTimes)
+	}
+}
+
+func shrinkTimesIfNeeded(items []time.Time) []time.Time {
+	if len(items)*2 >= cap(items) {
+		return items
+	}
+
+	shrunkItems := make([]time.Time, len(items))
+	copy(shrunkItems, items)
+
+	return shrunkItems
 }
 
 func actorIdentity(request SearchEventRequest) string {
@@ -594,6 +655,7 @@ func parseEventTime(rawTime string) (time.Time, error) {
 	rawTime = strings.TrimSpace(rawTime)
 
 	if rawTime == "" {
+		log.Println("created_at is empty, using server time")
 		return time.Now(), nil
 	}
 
