@@ -26,7 +26,7 @@ curl http://localhost:8080/healthz
 ### Отправить поисковое событие в брокер
 
 ```bash
-nats pub search.events '{"event_id":"evt-1","query":"iphone","user_id":"user-1","session_id":"session-1","created_at":"2026-05-26T15:20:00Z"}'
+nats pub search.events '{"event_id":"evt-1","query":"iphone","user_id":"user-1","session_id":"session-1"}'
 ```
 
 ### Получить популярные поисковые запросы
