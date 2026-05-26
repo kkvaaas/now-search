@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -21,13 +22,13 @@ const (
 
 	searchEventsSubject = "search.events"
 
+	spamGuardWindow    = time.Minute
 	spamGuardMaxEvents = 3
+
+	topSnapshotRefreshInterval = time.Second
 )
 
-var (
-	windowDuration  = 5 * time.Minute
-	spamGuardWindow = time.Minute
-)
+const windowDuration = 5 * time.Minute
 
 type TrendItem struct {
 	Query string `json:"query"`
@@ -72,9 +73,18 @@ type SearchEvent struct {
 	CreatedAt time.Time
 }
 
+type TopSnapshot struct {
+	Items     []TrendItem
+	UpdatedAt time.Time
+}
+
 type Aggregator struct {
 	mu     sync.Mutex
 	events []SearchEvent
+}
+
+type TopCache struct {
+	value atomic.Value
 }
 
 type StopList struct {
@@ -89,8 +99,11 @@ type SpamGuard struct {
 
 func main() {
 	aggregator := NewAggregator()
+	topCache := NewTopCache()
 	stopList := NewStopList()
 	spamGuard := NewSpamGuard()
+
+	startTopSnapshotUpdater(aggregator, stopList, topCache)
 
 	natsConn := connectNATS(aggregator, spamGuard)
 	if natsConn != nil {
@@ -100,7 +113,7 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", healthHandler)
-	mux.HandleFunc("GET /api/v1/trends/top", topHandler(aggregator, stopList))
+	mux.HandleFunc("GET /api/v1/trends/top", topHandler(topCache))
 	mux.HandleFunc("POST /debug/search-events", addSearchEventHandler(aggregator, spamGuard))
 
 	mux.HandleFunc("GET /api/v1/stop-list", getStopListHandler(stopList))
@@ -196,7 +209,7 @@ func (a *Aggregator) Add(query string, now time.Time) {
 	})
 }
 
-func (a *Aggregator) Top(limit int, now time.Time, stopWords map[string]struct{}) []TrendItem {
+func (a *Aggregator) BuildTop(limit int, now time.Time, stopWords map[string]struct{}) []TrendItem {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -247,7 +260,74 @@ func (a *Aggregator) removeOldEvents(now time.Time) {
 		}
 	}
 
+	if len(actualEvents)*2 < cap(actualEvents) {
+		shrunkEvents := make([]SearchEvent, len(actualEvents))
+		copy(shrunkEvents, actualEvents)
+		a.events = shrunkEvents
+		return
+	}
+
 	a.events = actualEvents
+}
+
+func NewTopCache() *TopCache {
+	cache := &TopCache{}
+
+	cache.value.Store(TopSnapshot{
+		Items:     []TrendItem{},
+		UpdatedAt: time.Now(),
+	})
+
+	return cache
+}
+
+func (c *TopCache) Store(items []TrendItem, updatedAt time.Time) {
+	copiedItems := make([]TrendItem, len(items))
+	copy(copiedItems, items)
+
+	c.value.Store(TopSnapshot{
+		Items:     copiedItems,
+		UpdatedAt: updatedAt,
+	})
+}
+
+func (c *TopCache) Get(limit int) []TrendItem {
+	rawSnapshot := c.value.Load()
+
+	snapshot, ok := rawSnapshot.(TopSnapshot)
+	if !ok {
+		return []TrendItem{}
+	}
+
+	if limit > len(snapshot.Items) {
+		limit = len(snapshot.Items)
+	}
+
+	items := make([]TrendItem, limit)
+	copy(items, snapshot.Items[:limit])
+
+	return items
+}
+
+func startTopSnapshotUpdater(aggregator *Aggregator, stopList *StopList, topCache *TopCache) {
+	updateTopSnapshot(aggregator, stopList, topCache)
+
+	go func() {
+		ticker := time.NewTicker(topSnapshotRefreshInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			updateTopSnapshot(aggregator, stopList, topCache)
+		}
+	}()
+}
+
+func updateTopSnapshot(aggregator *Aggregator, stopList *StopList, topCache *TopCache) {
+	now := time.Now()
+	stopWords := stopList.Snapshot()
+	items := aggregator.BuildTop(maxLimit, now, stopWords)
+
+	topCache.Store(items, now)
 }
 
 func NewStopList() *StopList {
@@ -366,7 +446,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func topHandler(aggregator *Aggregator, stopList *StopList) http.HandlerFunc {
+func topHandler(topCache *TopCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		limit := defaultLimit
 
@@ -390,12 +470,10 @@ func topHandler(aggregator *Aggregator, stopList *StopList) http.HandlerFunc {
 			limit = parsedLimit
 		}
 
-		stopWords := stopList.Snapshot()
-
 		response := TopResponse{
 			WindowSeconds: windowSeconds,
 			Limit:         limit,
-			Items:         aggregator.Top(limit, time.Now(), stopWords),
+			Items:         topCache.Get(limit),
 		}
 
 		writeJSON(w, http.StatusOK, response)
